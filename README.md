@@ -1,80 +1,161 @@
-# Cleaning Robot Perception + Motion Planning
+# Autonomous Cleaning Robot - Perception & Motion Planning
 
-Pure-Python core (`cleaning_robot/perception.py`, `cleaning_robot/motion_planning.py`,
-`cleaning_robot/config.py`) with no ROS dependency, so it's unit-testable on
-a laptop. `cleaning_robot/cleaning_robot_node.py` is the thin ROS 2 (rclpy)
-wrapper that feeds it real topics.
+A complete, high-performance perception and motion planning stack for an autonomous floor-cleaning robot. Features a **Dual-Layer Perception Engine** (Mahalanobis color-anomaly + spatial texture/gradient energy) and an **Opportunistic Motion Planner** (Boustrophedon coverage, dynamic target diversion, Archimedean spiral spot scrubbing, and path resumption).
 
-## Layout
-```
+Built with a pure-Python core (`NumPy`, `SciPy`, `OpenCV`) for instant, standalone testing on a laptop with a regular webcam or RGB-D camera, paired with a thin **ROS 2** wrapper (`cleaning_robot_node.py`) for physical robot deployment.
+
+---
+
+## Repository Layout
+
+```text
 cleaning_robot/
-  config.py              # calibration + tuning dataclasses (edit this first)
-  perception.py          # plane RANSAC, debris clustering, stain detection, transforms
-  motion_planning.py      # spiral/boustrophedon generators, pure pursuit, state machine
-  cleaning_robot_node.py  # ROS 2 node (rclpy, cv_bridge, message_filters, tf_transformations)
-test_pipeline.py          # synthetic-data validation, no ROS/camera required
+|-- cleaning_robot/
+|   |-- __init__.py
+|   |-- config.py              # Calibration parameters, camera extrinsics & tuning
+|   |-- perception.py          # Plane-RANSAC, 3D debris clustering, Mahalanobis stain detector
+|   |-- motion_planning.py     # Spiral/boustrophedon path generators, pure pursuit, state machine
+|   \-- cleaning_robot_node.py # ROS 2 node (rclpy, cv_bridge, message_filters, tf2)
+|
+|-- live_stain_test.py         # Real-time dual-layer webcam test with live sliders & classification
+|-- test_stain_detector.py     # 4-quadrant diagnostic dashboard (RGB, Heatmap, Raw Mask, Cleaned Mask)
+|-- visual_sim.py              # Interactive 2D visual simulator proving the coverage & scrub state machine
+|-- test_pipeline.py           # Automated unit tests on synthetic data (ground plane, debris, spiral coverage)
+\-- README.md
 ```
 
-## Run the tests
-```
-pip install numpy scipy
-python3 test_pipeline.py
-```
-This builds synthetic RGB-D frames (dense, via analytic ray/plane
-intersection) with known debris bumps and stain patches, and checks:
-- fitted plane normal vs. ground truth,
-- debris cluster localization vs. ground truth,
-- stain localization + Mahalanobis detection,
-- Monte-Carlo proof that the spiral scrub path's mop-footprint union
-  covers >99.5% of the target stain disk,
-- a full boustrophedon coverage pass under pure-pursuit control,
-- the coverage -> divert -> scrub -> resume state machine end to end.
+---
 
-## Run on the robot
-Requires ROS 2, `cv_bridge`, `message_filters`, `tf_transformations`, and a
-depth-aligned RGB-D driver (e.g. `realsense2_camera`). Adjust topic names in
-`cleaning_robot_node.py` to match your driver, and replace
-`config.CameraExtrinsics`'s hardcoded pitch/height with a URDF + tf2 lookup
-before trusting it for anything beyond bench testing.
+## 1. Quick-Start Testing Tools (No ROS Required)
 
+You can test every component of the system directly on your PC before deploying to a physical robot or ROS environment.
+
+### A. Live Webcam Perception Test (`live_stain_test.py`)
+Tests the **Dual-Layer Perception Engine** directly using your laptop webcam or external camera.
+
+```powershell
+pip install -r requirements.txt
+python live_stain_test.py
 ```
+
+* **How it works:**
+  1. Point the camera at a clean, empty patch of floor and press **`c`** to calibrate.
+  2. The script learns both your floor's baseline color $(\mu, \Sigma)$ in CIE Lab space and the tile smoothness.
+  3. Place objects on the floor:
+     * **`[STAIN: SCRUB]` (Green Box):** Flat discoloration, coffee, mud, or liquids triggers the scrubbing pipeline.
+     * **`[DEBRIS: AVOID]` (Orange Box):** 3D objects, phones, towels, or crumpled paper triggers obstacle avoidance.
+* **On-Screen Sliders (Real-time Tuning):**
+  * `Color Cutoff x10`: Lower to catch faint, low-contrast smudges; raise to reject floor discoloration.
+  * `Texture Cutoff x10`: Controls sensitivity to fabric wrinkles, paper folds, and edges.
+  * `Min Area (px)`: Filters out thin tile grout lines and digital camera noise (default 1200px).
+* **Controls:** `[c]` Calibrate | `[t]` Toggle Texture Heatmap | `[s]` Screenshot | `[q]` Quit.
+
+---
+
+### B. 4-Quadrant Diagnostic Tool (`test_stain_detector.py`)
+A comprehensive visual analytics dashboard breaking down every stage of the computer vision pipeline into 4 side-by-side quadrants.
+
+```powershell
+python test_stain_detector.py                   # Uses webcam or synthetic fallback
+python test_stain_detector.py --image floor.jpg # Test against a saved floor image
+```
+
+* **Quadrant 1:** Camera feed with centroid crosshairs and bounding radius.
+* **Quadrant 2:** Continuous Mahalanobis Distance Heatmap ($D_M = \sqrt{(p-\mu)^T \Sigma^{-1} (p-\mu)}$).
+* **Quadrant 3:** Raw binary thresholded candidate mask.
+* **Quadrant 4:** Morphologically filtered mask ready for target tracking.
+
+---
+
+### C. 2D Visual Simulator (`visual_sim.py`)
+Simulates the autonomous mop robot in a 2.4m x 1.7m arena with dynamic stain spawning and full state machine execution.
+
+```powershell
+python visual_sim.py
+```
+
+* **Controls:**
+  * `[SPACE]` : Pause / Resume
+  * `[S]`     : Spawn random stain on the floor
+  * `[R]`     : Reset simulation
+  * `[Q/ESC]` : Quit
+* **Features:**
+  * Real-time HUD showing robot pose, mission state (`COVERAGE`, `DIVERTING`, `SCRUBBING`), velocity ($v, \omega$), and clean % progress.
+  * Robust Pure Pursuit path tracking with in-place pivot turns for lane changes.
+  * Dynamic Archimedean spiral mop pattern covering the full stain area plus safety margin.
+  * Wall collision avoidance margins.
+
+---
+
+### D. Automated Math & Pipeline Unit Tests (`test_pipeline.py`)
+Validates the mathematical foundations against synthetic ground-truth data.
+
+```powershell
+python test_pipeline.py
+```
+
+Checks:
+1. **Plane-RANSAC:** Fits floor plane equation $ax + by + cz + d = 0$ with normal alignment $\cos\theta > 0.98$.
+2. **Debris Segmentation:** Verifies positive signed height thresholding ($5\text{mm} < h < 15\text{cm}$).
+3. **Stain Localization:** Ray/plane intersection with known floor geometry.
+4. **Monte-Carlo Coverage Proof:** Verifies $>99.5\%$ geometric mop footprint coverage over the target disk during spiral scrubs.
+5. **Mission Planner State Machine:** End-to-end verification of `COVERAGE` -> `DIVERTING` -> `SCRUBBING` -> `RESUME`.
+
+---
+
+## 2. Core Architecture & Design Decisions
+
+### Dual-Layer Perception: Why Color Alone Is Not Enough
+* **The Camouflage Problem:** A white towel or grey sock on light tile has almost zero color difference (both have near-zero chroma in CIE Lab). A pure color detector is blind to them.
+* **The Solution:** 
+  * **Layer 1 (Color Anomaly):** Flags color shifts against the clean floor baseline $\mathcal{N}(\mu, \Sigma)$ in CIE Lab space.
+  * **Layer 2 (Spatial Gradient Energy / Depth):** Measures surface wrinkles, creases, and physical height. Smooth tile has near-zero gradient energy; crumpled fabric or solid objects have high texture density.
+
+### Why Debris is Treated as an Obstacle (Not Scrubbed)
+* The robot's primary cleaning tool is a wet perimeter mop.
+* Driving a wet mop over solid debris (paper balls, socks, cables) smears paper pulp or jams the drive motors.
+* **Stains (Flat, $|h| < 5\text{mm}$):** Scrubbed via Archimedean spiral.
+* **Debris (Raised, $h > 10\text{mm}$):** Avoided via dynamic costmap keep-out zones (or vacuumed if hardware supports suction).
+
+### Stains Localized by Ray/Plane Intersection (Not Raw Depth)
+* Liquid puddles and wet stains are frequently IR-transparent or specular, causing consumer depth cameras (RealSense/OAK-D) to return zero or invalid depth right at the spill.
+* Our system intersects the 2D pixel ray from camera intrinsics $K$ with the **rigidly estimated ground plane** to compute the metric world coordinate $(X, Y)$ without needing per-pixel depth returns on the liquid itself.
+
+### Camera Mounting Geometry
+* **Tilt Angle:** $25^\circ$ downward pitch from horizontal (not straight down).
+* **Mounting Height:** $\sim 12\text{cm}$ above the floor.
+* **Why:** Avoids the near-field blind spot of RGB-D sensors ($<20\text{cm}$ minimum range) while providing a **0.3m to 1.8m forward lookahead** so the robot can brake and steer smoothly.
+
+---
+
+## 3. Physical Robot Deployment (ROS 2)
+
+### Dependencies
+* ROS 2 (Humble / Iron / Jazzy)
+* `rclpy`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`
+* `cv_bridge`, `message_filters`, `tf2_ros`
+* RGB-D camera driver (e.g. `realsense2_camera`)
+
+### Launch
+```bash
 ros2 run cleaning_robot cleaning_robot_node
 ```
 
-## Key design decisions worth knowing before you tune this
-- **Debris is treated as an obstacle, not a scrub target.** The only
-  actuator is a passive perimeter mop, which can smear/push solid debris
-  rather than clean it. If you add suction or a brush later, route
-  `DebrisDetector` output to a pickup behavior instead of the avoidance bias.
-- **Stains are localized by ray/plane intersection, not raw depth**,
-  because liquids are frequently IR-transparent or specular and give
-  noisy/absent depth returns exactly where you need them.
-- **Spiral pitch uses `R*(1-overlap)`, not `2R*(1-overlap)`.** A
-  continuous spiral only revisits a given angle once per full revolution
-  (unlike independently-spannable boustrophedon lanes), so the coverage
-  math is stricter -- see the docstring in `motion_planning.py` and the
-  Monte-Carlo test for the derivation. Getting this wrong leaves a
-  thin uncovered wedge right at the stain boundary.
-- **RANSAC refit is amortized** (`plane_refit_every_n_frames`, default
-  15) since the camera-to-floor geometry is rigid; per-frame work is just
-  a cached-plane dot product, not a fresh RANSAC every frame.
-- **Detections require N consecutive frames before triggering a divert**
-  (`min_consecutive_detections`, default 3) so single-frame noise (a
-  glare, a shadow) can't send the robot chasing nothing.
-- **The reactive debris-avoidance bias is a lightweight stand-in**, not a
-  costmap-based local planner. If Nav2 is already in your stack, feed
-  debris detections into its costmap as obstacles instead.
+The node subscribes to:
+* `/camera/color/image_raw` (`sensor_msgs/Image`)
+* `/camera/aligned_depth_to_color/image_raw` (`sensor_msgs/Image`)
+* `/odom` (`nav_msgs/Odometry`)
 
-## Things to tune for your hardware
-All in `config.py`:
-- `CameraExtrinsics.pitch_deg / height_m / forward_offset_m` -- measure or
-  calibrate against your actual mount.
-- `PerceptionConfig.debris_min_height_m` -- raise above your depth
-  sensor's actual noise floor (5mm is aggressive for many consumer RGB-D
-  sensors at 1-2m range; check your camera's datasheet).
-- `PerceptionConfig.mahalanobis_threshold` -- tune against real floor
-  material/lighting; log the mahalanobis map during bring-up to pick a
-  threshold with an acceptable false-positive rate.
-- `PlanningConfig.spiral_overlap / coverage_lane_overlap` -- increase if
-  you see gaps in practice due to odometry drift; the values here already
-  include a safety margin over the bare mathematical minimum.
+And publishes:
+* `/cmd_vel` (`geometry_msgs/Twist`)
+* Dynamic stain & debris markers for RViz visualization.
+
+---
+
+## 4. Tuning Parameters (`config.py`)
+
+* `CameraExtrinsics.pitch_deg`: Calibrate against your physical camera mount angle (default $25.0^\circ$).
+* `PerceptionConfig.mahalanobis_threshold`: Color sensitivity cutoff (default $4.2\sigma$).
+* `PerceptionConfig.debris_min_height_m`: Minimum height to consider as 3D obstacle (default $0.005\text{m}$ / $5\text{mm}$).
+* `PlanningConfig.spiral_overlap`: Radial overlap between successive spiral scrub turns (default $0.35$).
+* `PlanningConfig.coverage_lane_overlap`: Overlap between boustrophedon sweep passes (default $0.15$).

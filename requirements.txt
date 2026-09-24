@@ -1,0 +1,12 @@
+# Autonomous Cleaning Robot — Python Requirements
+# Install with: pip install -r requirements.txt
+
+# --- Core Computer Vision & Linear Algebra (Required) ---
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python>=4.8.0
+
+# --- Optional Hardware Drivers (Uncomment if using hardware) ---
+# pyrealsense2>=2.54.0   # Intel RealSense D435 / D455 RGB-D cameras
+# depthai>=2.24.0       # Luxonis OAK-D cameras
+# ultralytics>=8.0.0    # If running custom YOLO object detectors
