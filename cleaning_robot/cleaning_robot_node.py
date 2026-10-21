@@ -29,6 +29,8 @@ in config.CameraExtrinsics). Swap message_filters' sync policy or topic
 names to match your driver (e.g. realsense2_camera's default topics).
 """
 
+from collections import deque
+import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -48,6 +50,7 @@ from cleaning_robot.config import RobotConfig
 from cleaning_robot.perception import (
     GroundPlaneEstimator, DebrisDetector, FloorColorModel, StainDetector,
     CoordinateTransformer, DetectionTracker, backproject_depth,
+    detection_to_planning_frame, depth_image_to_meters, interpolate_planar_pose,
 )
 from cleaning_robot.motion_planning import MissionPlanner, MissionState, generate_boustrophedon
 
@@ -77,6 +80,10 @@ class CleaningRobotNode(Node):
             self.cfg.planning.coverage_lane_overlap)
         self.mission = MissionPlanner(self.cfg.planning, self.cfg.geometry, coverage_path)
         self.current_pose = (0.0, 0.0, 0.0)
+        self._odom_history = deque(maxlen=200)
+        self._last_frame_time = None
+        self._last_odom_time = None
+        self._camera_info_ready = False
 
         # ---- Callback groups: perception vs control run concurrently ----
         perception_group = MutuallyExclusiveCallbackGroup()
@@ -117,12 +124,22 @@ class CleaningRobotNode(Node):
         self.cfg.intrinsics.cy = msg.k[5]
         self.cfg.intrinsics.width = msg.width
         self.cfg.intrinsics.height = msg.height
+        self._camera_info_ready = True
 
     def _on_frame(self, rgb_msg: Image, depth_msg: Image) -> None:
+        if not self._camera_info_ready:
+            return
+        stamp = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
+        observation_pose = interpolate_planar_pose(tuple(self._odom_history.copy()), stamp)
+        if observation_pose is None:
+            return  # require odometry at the image acquisition time
         rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
-        depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
-        # Some drivers publish depth in mm as 16UC1 -- convert if needed:
-        # depth = depth.astype(np.float32) / 1000.0
+        try:
+            raw_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            depth = depth_image_to_meters(raw_depth, depth_msg.encoding)
+        except ValueError as error:
+            self.get_logger().error(str(error), once=True)
+            return
 
         points_cam, valid = backproject_depth(depth, self.cfg.intrinsics)
         if not self.plane_estimator.update(points_cam, valid):
@@ -158,11 +175,13 @@ class CleaningRobotNode(Node):
             stain_dets, self.plane_estimator.normal, self.plane_estimator.d)
         self.stain_detector.update_background_model(lab, floor_mask)
 
-        # --- Temporal confirmation (separately per kind) ---
-        confirmed_debris = self.tracker.update(debris_dets)
-        confirmed_stains = self.tracker.update(stain_dets)
-        self._latest_confirmed_debris = [d for d in confirmed_debris if d.kind == 'debris']
-        self._latest_confirmed_stains = [d for d in confirmed_stains if d.kind == 'stain']
+        # One tracker update per sensor frame, in a fixed odometry frame.
+        fixed = [detection_to_planning_frame(d, observation_pose)
+                 for d in debris_dets + stain_dets]
+        confirmed = self.tracker.update(fixed)
+        self._latest_confirmed_debris = [d for d in confirmed if d.kind == 'debris']
+        self._latest_confirmed_stains = [d for d in confirmed if d.kind == 'stain']
+        self._last_frame_time = time.monotonic()
 
     # ------------------------------------------------------------------
     # Odometry + control
@@ -172,8 +191,16 @@ class CleaningRobotNode(Node):
         q = msg.pose.pose.orientation
         _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.current_pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        self._odom_history.append((stamp, self.current_pose))
+        self._last_odom_time = time.monotonic()
 
     def _control_tick(self) -> None:
+        now = time.monotonic()
+        if (self._last_frame_time is None or self._last_odom_time is None
+                or now - self._last_frame_time > 0.5 or now - self._last_odom_time > 0.5):
+            self.cmd_pub.publish(Twist())
+            return
         linear, angular = self.mission.update(
             self.current_pose, self._latest_confirmed_stains, self._latest_confirmed_debris)
 

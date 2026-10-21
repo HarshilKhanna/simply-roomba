@@ -7,6 +7,6 @@ scipy>=1.10.0
 opencv-python>=4.8.0
 
 # --- Optional Hardware Drivers (Uncomment if using hardware) ---
-# pyrealsense2>=2.54.0   # Intel RealSense D435 / D455 RGB-D cameras
+# pyrealsense2>=2.54.0   # RealSense D405 (optional; simulation needs no camera)
 # depthai>=2.24.0       # Luxonis OAK-D cameras
 # ultralytics>=8.0.0    # If running custom YOLO object detectors

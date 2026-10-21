@@ -58,8 +58,11 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .config import PlanningConfig, RobotGeometry
-from .perception import Detection
+from .config import PlanningConfig, RobotGeometry, CollectorConfig
+from .perception import Detection, detection_to_planning_frame
+from .collector import (CollectorCommand, CollectorFeedback, pickup_rejection,
+                        collector_navigation_radius)
+from .navigation import ArenaNavigator
 
 
 # ----------------------------------------------------------------------------
@@ -131,6 +134,8 @@ def generate_boustrophedon(x_min: float, x_max: float, y_min: float, y_max: floa
     lane_spacing = 2.0 * robot_radius_m * (1.0 - overlap_ratio)
     lane_spacing = max(lane_spacing, 1e-3)
     lanes_y = np.arange(y_min, y_max + 1e-9, lane_spacing)
+    if len(lanes_y) and y_max - lanes_y[-1] > 1e-9:
+        lanes_y = np.append(lanes_y, y_max)
 
     waypoints = []
     for i, y in enumerate(lanes_y):
@@ -283,11 +288,20 @@ class MissionState(Enum):
     COVERAGE = auto()
     DIVERTING = auto()
     SCRUBBING = auto()
+    APPROACHING_DEBRIS = auto()
+    ALIGNING_PICKUP = auto()
+    COLLECTING = auto()
+    VERIFYING_PICKUP = auto()
+    RECOVERING_PICKUP = auto()
+    RETURNING_HOME = auto()
+    WAITING_FOR_UNLOAD = auto()
+    RESUMING_COVERAGE = auto()
+    FAULT = auto()
     DONE = auto()
 
 
 @dataclass
-class MissionPlanner:
+class _StainMissionPlanner:
     """Owns the coverage path and orchestrates interrupt-divert-scrub-resume.
 
     Debris detections never generate a divert -- they only bias steering
@@ -339,15 +353,16 @@ class MissionPlanner:
     # -- internals -------------------------------------------------------
 
     def _ingest_new_stains(self, pose_xytheta, confirmed_stains: List[Detection]) -> None:
-        known_ids = {id(t) for t in self.pending_stains}
+        known_ids = {t.track_id for t in self.pending_stains}
         if self.current_target is not None:
-            known_ids.add(id(self.current_target))
+            known_ids.add(self.current_target.track_id)
         for stain in confirmed_stains:
             if stain.track_id in self.handled_track_ids:
                 continue
-            if id(stain) in known_ids:
+            if stain.track_id in known_ids:
                 continue
             self.pending_stains.append(stain)
+            known_ids.add(stain.track_id)
 
     def _closest_pending_stain(self, pose_xytheta) -> Tuple[Optional[Detection], Optional[int]]:
         if not self.pending_stains:
@@ -426,3 +441,415 @@ class MissionPlanner:
             self.state = MissionState.COVERAGE
             return 0.0, 0.0
         return linear, angular
+
+
+@dataclass
+class MissionPlanner(_StainMissionPlanner):
+    """Shared mop/collector mission, independent of ROS and simulation.
+
+    Inputs must be observations in a fixed planning frame, or explicitly
+    marked base_link observations accompanied by their acquisition pose.
+    Collection defaults off. Enabling it requires actuator feedback.
+    """
+    collector_cfg: CollectorConfig = field(default_factory=CollectorConfig)
+    navigator: Optional[ArenaNavigator] = None
+    home_pose: Optional[Tuple[float, float, float]] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.time_s = 0.0
+        self.collector_command = CollectorCommand.STOW
+        self.carried_target = None
+        self.failed_pickup_ids = set()
+        self.deferred_pickup_ids = {}
+        self.known_debris = {}
+        self.events = []
+        self.pickup_attempts = 0
+        self._state_since = 0.0
+        self._phase_since = 0.0
+        self._pickup_phase = CollectorCommand.LOWER
+        self._resume_pose = None
+        self._pickup_pose = None
+        self._approach_pose = None
+        self._route = None
+        self._route_key = None
+        self._route_index = 1
+        self._feedback = None
+        self._last_payload_evidence = None
+        self.last_navigation_error = None
+        self._record("mission initialized")
+
+    def _record(self, message):
+        self.events.append({"time_s": round(self.time_s, 3), "state": self.state.name,
+                            "message": message,
+                            "track_id": getattr(self.current_target, "track_id", None)})
+
+    def _transition(self, state, message):
+        self.state = state
+        self._state_since = self.time_s
+        self._route = self._route_key = None
+        self._record(message)
+
+    @property
+    def mop_enabled(self):
+        return self.state in (MissionState.COVERAGE, MissionState.SCRUBBING)
+
+    @property
+    def active_route(self):
+        return self._route
+
+    def confirm_unloaded(self) -> bool:
+        """Explicit operator acknowledgement. Ignored outside the home wait."""
+        if self.state != MissionState.WAITING_FOR_UNLOAD:
+            return False
+        self.carried_target = None
+        self.current_target = None
+        self.collector_command = CollectorCommand.STOW
+        self._transition(MissionState.RESUMING_COVERAGE, "operator confirmed unloading")
+        return True
+
+    def update(self, pose_xytheta, confirmed_stains, confirmed_debris, *,
+               dt: float = 0.05, collector_feedback: Optional[CollectorFeedback] = None):
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError("dt must be a finite positive number")
+        self.time_s += dt
+        if self.home_pose is None:
+            self.home_pose = tuple(pose_xytheta)
+        self._feedback = collector_feedback
+        if collector_feedback is not None and collector_feedback.payload_present is True:
+            self._last_payload_evidence = self.time_s
+        stains = [detection_to_planning_frame(d, pose_xytheta) for d in confirmed_stains]
+        debris = [detection_to_planning_frame(d, pose_xytheta) for d in confirmed_debris]
+        self._ingest_new_stains(pose_xytheta, stains)
+        for det in debris:
+            if det.track_id is None or det.track_id in self.handled_track_ids:
+                continue
+            self.known_debris[det.track_id] = det
+            if (self.current_target is not None and self.current_target.kind == "debris"
+                    and self.current_target.track_id == det.track_id):
+                self.current_target = det
+        if self.navigator is not None:
+            self.navigator.observe(self.known_debris.values(), self.handled_track_ids)
+        if (collector_feedback is not None and collector_feedback.fault
+                and self.collector_cfg.enabled and self.state != MissionState.FAULT):
+            self.collector_command = CollectorCommand.HOLD
+            self._transition(MissionState.FAULT, "collector fault: " + collector_feedback.fault)
+
+        handlers = {
+            MissionState.COVERAGE: self._run_coverage,
+            MissionState.DIVERTING: self._run_diverting,
+            MissionState.SCRUBBING: self._run_scrubbing,
+            MissionState.APPROACHING_DEBRIS: self._run_approach,
+            MissionState.ALIGNING_PICKUP: self._run_alignment,
+            MissionState.COLLECTING: self._run_collection,
+            MissionState.VERIFYING_PICKUP: self._run_verification,
+            MissionState.RECOVERING_PICKUP: self._run_recovery,
+            MissionState.RETURNING_HOME: self._run_return,
+            MissionState.RESUMING_COVERAGE: self._run_resume,
+        }
+        handler = handlers.get(self.state)
+        linear, angular = handler(pose_xytheta) if handler is not None else (0.0, 0.0)
+        if self.state in (MissionState.FAULT, MissionState.DONE, MissionState.WAITING_FOR_UNLOAD,
+                          MissionState.COLLECTING, MissionState.VERIFYING_PICKUP,
+                          MissionState.RECOVERING_PICKUP):
+            linear, angular = 0.0, 0.0
+        # The arena router handles avoidance in simulation. Keep the existing
+        # lightweight steering layer for the legacy mop-only ROS integration.
+        if self.navigator is None and self.state in (
+                MissionState.COVERAGE, MissionState.DIVERTING, MissionState.SCRUBBING):
+            obstacles = [d for d in debris if d.track_id not in self.handled_track_ids]
+            angular = float(np.clip(angular + repulsive_angular_bias(
+                pose_xytheta, obstacles, self.geometry.chassis_radius_m),
+                -self.geometry.max_angular_vel, self.geometry.max_angular_vel))
+        return float(linear), float(angular)
+
+    def _save_checkpoint(self, pose):
+        self.resume_index = self.coverage_index
+        self._resume_pose = tuple(pose)
+
+    def _navigation_radius(self, extended=False):
+        if not self.collector_cfg.enabled:
+            return self.geometry.chassis_radius_m
+        return collector_navigation_radius(self.collector_cfg, self.geometry.chassis_radius_m, extended)
+
+    @staticmethod
+    def _angle_error(goal, actual):
+        return (goal - actual + np.pi) % (2 * np.pi) - np.pi
+
+    def _drive_point(self, pose, goal, speed, tolerance):
+        delta = np.asarray(goal) - np.asarray(pose[:2])
+        distance = float(np.linalg.norm(delta))
+        if distance <= tolerance:
+            return 0.0, 0.0, True
+        error = self._angle_error(np.arctan2(delta[1], delta[0]), pose[2])
+        angular = float(np.clip(3.0 * error, -self.geometry.max_angular_vel,
+                                self.geometry.max_angular_vel))
+        linear = min(speed, 1.8 * distance) * max(0.0, np.cos(error)) if abs(error) < 0.35 else 0.0
+        return linear, angular, False
+
+    def _navigate(self, pose, goal, speed, *, extended=False, tolerance=None, heading=None, ignore_id=None):
+        tolerance = self.collector_cfg.home_tolerance_m if tolerance is None else tolerance
+        goal = np.asarray(goal, dtype=float)
+        radius = self._navigation_radius(extended)
+        revision = self.navigator.revision if self.navigator is not None else 0
+        key = (tuple(goal), radius, revision, ignore_id)
+        if self._route_key != key or self._route is None:
+            self._route = (self.navigator.route(pose[:2], goal, radius, ignore_id) if self.navigator is not None
+                           else np.array([pose[:2], goal]))
+            self._route_key, self._route_index = key, 1
+            self.last_navigation_error = None if self._route is not None else "no collision-free route"
+        if self._route is None:
+            return 0.0, 0.0, False
+        while self._route_index < len(self._route) - 1 and np.linalg.norm(
+                self._route[self._route_index] - pose[:2]) < 0.02:
+            self._route_index += 1
+        is_last = self._route_index == len(self._route) - 1
+        v, w, arrived = self._drive_point(pose, self._route[self._route_index], speed,
+                                         tolerance if is_last else 0.02)
+        if arrived and is_last and heading is not None:
+            error = self._angle_error(heading, pose[2])
+            if abs(error) > self.collector_cfg.heading_tolerance_rad:
+                return 0.0, float(np.clip(3 * error, -self.geometry.max_angular_vel,
+                                           self.geometry.max_angular_vel)), False
+        return v, w, arrived and is_last
+
+    def _select_pickup(self, pose):
+        candidates = sorted(self.known_debris.values(),
+                            key=lambda d: np.linalg.norm(d.position_robot[:2] - pose[:2]))
+        for target in candidates:
+            if target.track_id in self.handled_track_ids or target.track_id in self.failed_pickup_ids:
+                continue
+            revision = self.navigator.revision if self.navigator is not None else 0
+            if self.deferred_pickup_ids.get(target.track_id) == revision:
+                continue
+            if pickup_rejection(target, self.collector_cfg) is not None:
+                continue
+            if (self.coverage_index < len(self.coverage_path)-1 and
+                    np.linalg.norm(target.position_robot[:2] - pose[:2]) > self.cfg.divert_max_distance_m):
+                continue
+            bearing = np.arctan2(target.position_robot[1] - pose[1], target.position_robot[0] - pose[0])
+            if target.orientation_rad is not None and target.size_m[0] > 1.4 * target.size_m[1]:
+                headings = [target.orientation_rad, target.orientation_rad + np.pi]
+            else:
+                headings = [bearing + i * np.pi / 4 for i in range(8)]
+            options = []
+            for theta in headings:
+                direction = np.array([np.cos(theta), np.sin(theta)])
+                pickup = target.position_robot[:2] - self.collector_cfg.pickup_offset_m * direction
+                approach = pickup - self.collector_cfg.approach_standoff_m * direction
+                # A feasible pickup also needs room to rotate with its payload.
+                # Reject a pose before closing the claw if it cannot start a
+                # return route with the conservative carrying envelope.
+                if self.navigator is not None and not self.navigator.point_clear(
+                        pickup, self._navigation_radius(extended=True), ignore_id=target.track_id):
+                    continue
+                route = (self.navigator.route(pose[:2], approach, self._navigation_radius())
+                         if self.navigator is not None else np.array([pose[:2], approach]))
+                if route is None:
+                    continue
+                if self.navigator is not None:
+                    # Intentional tool contact is allowed only for the selected
+                    # item; the chassis must still clear that item completely.
+                    if not self.navigator.segment_clear(approach, pickup, self._navigation_radius(),
+                                                        ignore_id=target.track_id):
+                        continue
+                    if not self.navigator.segment_clear(approach, pickup, self.geometry.chassis_radius_m):
+                        continue
+                cost = np.linalg.norm(np.diff(route, axis=0), axis=1).sum()
+                options.append((cost, tuple(pickup) + (theta,), tuple(approach) + (theta,)))
+            if options:
+                _, self._pickup_pose, self._approach_pose = min(options, key=lambda x: x[0])
+                self.current_target = target
+                self.pickup_attempts = 1
+                self._save_checkpoint(pose)
+                self._transition(MissionState.APPROACHING_DEBRIS, "collect " + target.object_class)
+                return True
+            self.deferred_pickup_ids[target.track_id] = revision
+            self._record(f"deferred constrained litter track {target.track_id}")
+        return False
+
+    def _run_coverage(self, pose):
+        if self.collector_cfg.enabled and self._select_pickup(pose):
+            return 0.0, 0.0
+        if self.navigator is None:
+            self._save_checkpoint(pose)
+            return super()._run_coverage(pose)
+        target, index = self._closest_pending_stain(pose)
+        if target is not None:
+            self.pending_stains.pop(index)
+            self.current_target = target
+            self._save_checkpoint(pose)
+            self._transition(MissionState.DIVERTING, "divert to stain")
+            return 0.0, 0.0
+        if self.coverage_index >= len(self.coverage_path) - 1:
+            self._transition(MissionState.DONE, "coverage complete")
+            return 0.0, 0.0
+        goal = self.coverage_path[self.coverage_index + 1]
+        v, w, arrived = self._navigate(pose, goal, self.geometry.max_linear_vel)
+        if arrived:
+            self.coverage_index += 1
+            self._route_key = None
+        elif self.last_navigation_error:
+            self._transition(MissionState.FAULT, self.last_navigation_error)
+        return v, w
+
+    def _run_diverting(self, pose):
+        if self.navigator is None:
+            return super()._run_diverting(pose)
+        v, w, arrived = self._navigate(pose, self.current_target.position_robot[:2],
+                                      self.geometry.nav_linear_vel)
+        if arrived:
+            self._start_scrub()
+            self._record("start mop scrub")
+        elif self.last_navigation_error:
+            self._record("stain currently unreachable")
+            self.current_target = None
+            self._transition(MissionState.RESUMING_COVERAGE, "resume after unreachable stain")
+        return v, w
+
+    def _run_scrubbing(self, pose):
+        if self.navigator is None:
+            return super()._run_scrubbing(pose)
+        if self.scrub_index < len(self.scrub_path):
+            v, w, arrived = self._navigate(pose, self.scrub_path[self.scrub_index],
+                                          self.geometry.scrub_linear_vel, tolerance=0.018)
+            if arrived:
+                self.scrub_index += 1
+                self._route_key = None
+            elif self.last_navigation_error:
+                self._transition(MissionState.FAULT, "scrub path blocked")
+            return v, w
+        if self.current_target.track_id is not None:
+            self.handled_track_ids.add(self.current_target.track_id)
+        self.current_target, self.scrub_path = None, None
+        self._transition(MissionState.RESUMING_COVERAGE, "stain scrub finished")
+        return 0.0, 0.0
+
+    def _run_approach(self, pose):
+        v, w, arrived = self._navigate(pose, self._approach_pose[:2], self.geometry.nav_linear_vel,
+                                      heading=self._approach_pose[2])
+        if arrived:
+            self._transition(MissionState.ALIGNING_PICKUP, "align palm with litter")
+        elif self.last_navigation_error or self.time_s - self._state_since > self.collector_cfg.navigation_timeout_s:
+            self._pickup_failed("approach unavailable or timed out")
+        return v, w
+
+    def _run_alignment(self, pose):
+        seen = self.current_target.observed_at_s
+        if seen is not None and self.time_s - seen > 1.0:
+            # Allow the consecutive-frame gate to reacquire a target after
+            # turning toward it. No collector motion without fresh evidence.
+            if self.time_s - self._state_since > 1.0:
+                self._pickup_failed("lost visual confirmation during alignment")
+            return 0.0, 0.0
+        if self.navigator is not None and (not self.navigator.segment_clear(
+                pose[:2], self._pickup_pose[:2], self._navigation_radius(),
+                ignore_id=self.current_target.track_id) or not self.navigator.segment_clear(
+                pose[:2], self._pickup_pose[:2], self.geometry.chassis_radius_m)):
+            self.deferred_pickup_ids[self.current_target.track_id] = self.navigator.revision
+            self.current_target = None
+            self.collector_command = CollectorCommand.STOW
+            self._transition(MissionState.RESUMING_COVERAGE, "pickup deferred: approach corridor blocked")
+            return 0.0, 0.0
+        v, w, arrived = self._navigate(pose, self._pickup_pose[:2], self.collector_cfg.pickup_speed_m_s,
+                                      tolerance=self.collector_cfg.alignment_tolerance_m,
+                                      heading=self._pickup_pose[2], ignore_id=self.current_target.track_id)
+        if arrived:
+            if self.navigator is not None and self.navigator.route(
+                    pose[:2], self.home_pose[:2], self._navigation_radius(True),
+                    ignore_id=self.current_target.track_id) is None:
+                self.deferred_pickup_ids[self.current_target.track_id] = self.navigator.revision
+                self.current_target = None
+                self.collector_command = CollectorCommand.STOW
+                self._transition(MissionState.RESUMING_COVERAGE,
+                                 "pickup deferred: return clearance unavailable")
+                return 0.0, 0.0
+            self._pickup_phase = self.collector_command = CollectorCommand.LOWER
+            self._phase_since = self.time_s
+            self._transition(MissionState.COLLECTING, f"pickup attempt {self.pickup_attempts}")
+        elif self.last_navigation_error or self.time_s - self._state_since > self.collector_cfg.navigation_timeout_s:
+            self._pickup_failed("alignment unavailable or timed out")
+        return v, w
+
+    def _run_collection(self, pose):
+        feedback = self._feedback
+        if feedback is not None and feedback.command == self._pickup_phase and feedback.completed:
+            if self._pickup_phase == CollectorCommand.LOWER:
+                self._pickup_phase = self.collector_command = CollectorCommand.CLOSE
+            elif self._pickup_phase == CollectorCommand.CLOSE:
+                self._pickup_phase = self.collector_command = CollectorCommand.LIFT
+            else:
+                self.collector_command = CollectorCommand.HOLD
+                self._transition(MissionState.VERIFYING_PICKUP, "verify lifted payload")
+            self._phase_since = self.time_s
+        elif self.time_s - self._phase_since > self.collector_cfg.operation_timeout_s:
+            self._pickup_failed("actuator completion timed out")
+        return 0.0, 0.0
+
+    def _run_verification(self, pose):
+        evidence = None if self._feedback is None else self._feedback.payload_present
+        if evidence is True:
+            self.carried_target = self.current_target
+            self.handled_track_ids.add(self.current_target.track_id)
+            self._transition(MissionState.RETURNING_HOME, "pickup verified; return home")
+        elif evidence is False or self.time_s - self._state_since > self.collector_cfg.verification_timeout_s:
+            self._pickup_failed("payload verification failed")
+        return 0.0, 0.0
+
+    def _pickup_failed(self, reason):
+        self.collector_command = CollectorCommand.STOW
+        if self.pickup_attempts < self.collector_cfg.max_pickup_attempts:
+            self.pickup_attempts += 1
+            self._transition(MissionState.RECOVERING_PICKUP, reason + "; retry")
+        else:
+            self.failed_pickup_ids.add(self.current_target.track_id)
+            self.current_target = None
+            self._transition(MissionState.RESUMING_COVERAGE, reason + "; attempts exhausted")
+
+    def _stowed(self):
+        if not self.collector_cfg.enabled:
+            return True
+        return (self._feedback is not None and self._feedback.command == CollectorCommand.STOW
+                and self._feedback.completed and self._feedback.payload_present is False)
+
+    def _run_recovery(self, pose):
+        if self._stowed():
+            self._transition(MissionState.APPROACHING_DEBRIS, "collector reset for retry")
+        elif self.time_s - self._state_since > self.collector_cfg.operation_timeout_s:
+            self._transition(MissionState.FAULT, "collector did not stow after failed pickup")
+        return 0.0, 0.0
+
+    def _run_return(self, pose):
+        self.collector_command = CollectorCommand.HOLD
+        if self._feedback is not None and self._feedback.payload_present is False:
+            self._transition(MissionState.FAULT, "payload lost during transport")
+            return 0.0, 0.0
+        if (self._last_payload_evidence is None or self.time_s - self._last_payload_evidence
+                > self.collector_cfg.verification_timeout_s):
+            self._transition(MissionState.FAULT, "payload feedback lost during transport")
+            return 0.0, 0.0
+        v, w, arrived = self._navigate(pose, self.home_pose[:2], self.collector_cfg.return_speed_m_s,
+                                      extended=True, heading=self.home_pose[2])
+        if arrived:
+            self._transition(MissionState.WAITING_FOR_UNLOAD, "home reached; waiting for operator")
+        elif self.last_navigation_error or self.time_s - self._state_since > self.collector_cfg.navigation_timeout_s:
+            self._transition(MissionState.FAULT, "return route unavailable or timed out")
+        return v, w
+
+    def _run_resume(self, pose):
+        self.collector_command = CollectorCommand.STOW
+        if not self._stowed():
+            if self.time_s - self._state_since > self.collector_cfg.operation_timeout_s:
+                self._transition(MissionState.FAULT, "collector not empty and stowed")
+            return 0.0, 0.0
+        if self._resume_pose is None:
+            self._transition(MissionState.COVERAGE, "resume coverage")
+            return 0.0, 0.0
+        v, w, arrived = self._navigate(pose, self._resume_pose[:2], self.geometry.nav_linear_vel,
+                                      heading=self._resume_pose[2])
+        if arrived:
+            self.coverage_index = self.resume_index
+            self._transition(MissionState.COVERAGE, "saved coverage checkpoint reached")
+        elif self.last_navigation_error or self.time_s - self._state_since > self.collector_cfg.navigation_timeout_s:
+            self._transition(MissionState.FAULT, "coverage checkpoint unavailable")
+        return v, w

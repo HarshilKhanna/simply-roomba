@@ -52,7 +52,7 @@ Design summary
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -64,6 +64,36 @@ from .config import CameraIntrinsics, CameraExtrinsics, PerceptionConfig
 # ----------------------------------------------------------------------------
 # Geometry helpers
 # ----------------------------------------------------------------------------
+
+def depth_image_to_meters(depth: np.ndarray, encoding: str) -> np.ndarray:
+    """Normalize ROS depth encodings, not native SDK Z16 depth units."""
+    if encoding == "16UC1":
+        result = np.asarray(depth, dtype=np.float32) * 0.001
+    elif encoding == "32FC1":
+        result = np.asarray(depth, dtype=np.float32).copy()
+    else:
+        raise ValueError(f"unsupported ROS depth encoding: {encoding}")
+    result[~np.isfinite(result) | (result <= 0)] = 0
+    return result
+
+
+def interpolate_planar_pose(samples, timestamp: float, max_extrapolation_s=0.1):
+    """Interpolate timestamped (time, x/y/yaw) odometry across yaw wrapping."""
+    if not samples:
+        return None
+    if timestamp <= samples[0][0]:
+        return samples[0][1] if samples[0][0] - timestamp <= max_extrapolation_s else None
+    if timestamp >= samples[-1][0]:
+        return samples[-1][1] if timestamp - samples[-1][0] <= max_extrapolation_s else None
+    for (before, pose_before), (after, pose_after) in zip(samples, samples[1:]):
+        if before <= timestamp <= after:
+            alpha = (timestamp - before) / max(after - before, 1e-12)
+            xy = (1-alpha) * np.asarray(pose_before[:2]) + alpha * np.asarray(pose_after[:2])
+            yaw_delta = (pose_after[2] - pose_before[2] + np.pi) % (2*np.pi) - np.pi
+            yaw = pose_before[2] + alpha*yaw_delta
+            return float(xy[0]), float(xy[1]), float((yaw + np.pi) % (2*np.pi) - np.pi)
+    return None
+
 
 def backproject_depth(depth_m: np.ndarray, intr: CameraIntrinsics) -> Tuple[np.ndarray, np.ndarray]:
     """Vectorized pinhole back-projection.
@@ -82,7 +112,7 @@ def backproject_depth(depth_m: np.ndarray, intr: CameraIntrinsics) -> Tuple[np.n
     x = (u - intr.cx) * z / intr.fx
     y = (v - intr.cy) * z / intr.fy
     points = np.stack([x, y, z], axis=-1)
-    valid = z > 1e-4
+    valid = np.isfinite(z) & (z > 1e-4)
     return points, valid
 
 
@@ -248,15 +278,42 @@ class Detection:
     frame_id: int = 0
     track_id: Optional[int] = None
     confidence: int = 1
+    # position_robot is retained for API compatibility. Its actual frame is
+    # explicit here; the mission planner consumes "odom"/"planning" positions.
+    coordinate_frame: str = "base_link"
+    object_class: Optional[str] = None
+    size_m: Optional[Tuple[float, float, float]] = None  # length, width, height
+    orientation_rad: Optional[float] = None
+    estimated_mass_kg: Optional[float] = None
+    observed_at_s: Optional[float] = None
+
+
+def detection_to_planning_frame(det: Detection, pose_xytheta,
+                                frame: str = "odom") -> Detection:
+    """Copy a base-relative observation into a fixed planning frame.
+
+    Supply the robot pose at the observation timestamp, not a later control
+    pose. Already-fixed observations are copied, never transformed twice.
+    """
+    if det.coordinate_frame in (frame, "planning"):
+        return replace(det, position_robot=np.array(det.position_robot, copy=True))
+    if det.coordinate_frame != "base_link":
+        raise ValueError(f"cannot plan a detection in {det.coordinate_frame!r}")
+    x, y, theta = pose_xytheta
+    c, s = np.cos(theta), np.sin(theta)
+    position = np.array(det.position_robot, dtype=float, copy=True)
+    position[:2] = np.array([[c, -s], [s, c]]) @ position[:2] + [x, y]
+    orientation = None if det.orientation_rad is None else det.orientation_rad + theta
+    return replace(det, position_robot=position, coordinate_frame=frame,
+                   orientation_rad=orientation)
 
 
 class DebrisDetector:
-    """3D obstacle detection: pixels sticking meaningfully above the floor
-    plane. Physical debris is treated as an obstacle to route AROUND, not
-    scrub over -- this robot's only actuator is a passive perimeter mop,
-    which can smear/push solid debris rather than clean it. If a future
-    hardware revision adds suction or a brush, route DebrisDetector output
-    to a pickup behavior instead of the avoidance costmap.
+    """Geometric proposals for pixels raised above the floor plane.
+
+    These unclassified detections remain obstacles. A semantic/eligibility
+    adapter must supply litter class and dimensions before the collector
+    mission can select them; height alone does not identify disposable litter.
     """
 
     def __init__(self, cfg: PerceptionConfig, intr: CameraIntrinsics):
@@ -296,6 +353,7 @@ class DebrisDetector:
                 position_robot=centroid_cam,  # transformed to robot frame by caller
                 radius_m=extent,
                 pixel_centroid=pixel_centroid,
+                coordinate_frame="camera_optical",
             ))
         return detections
 
@@ -435,6 +493,7 @@ class CoordinateTransformer:
         for det in detections:
             p_robot = transform_points(det.position_robot.reshape(1, 3), self.T_base_cam)[0]
             det.position_robot = p_robot
+            det.coordinate_frame = "base_link"
             out.append(det)
         return out
 
@@ -456,6 +515,7 @@ class CoordinateTransformer:
             pixel_to_meter = range_m / self.intr.fx  # small-angle approx, per-pixel
             det.radius_m = max(det.radius_m * pixel_to_meter, 0.02)
             det.position_robot = p_robot
+            det.coordinate_frame = "base_link"
             out.append(det)
         return out
 
@@ -468,24 +528,35 @@ class DetectionTracker:
     """Nearest-neighbor tracker with a 'confirm after N consecutive frames'
     gate, so a single-frame false positive can't trigger a divert."""
 
-    def __init__(self, cfg: PerceptionConfig):
+    def __init__(self, cfg: PerceptionConfig, max_missed_frames: Optional[int] = 5):
         self.cfg = cfg
+        self.max_missed_frames = max_missed_frames
         self._tracks: List[Detection] = []
         self._next_id = 0
         self._misses = {}  # track_id -> consecutive miss count
 
     def update(self, detections: List[Detection]) -> List[Detection]:
-        """Associate new detections to existing tracks by nearest neighbor
-        in (x, y); returns the list of CONFIRMED tracks (confidence >=
-        min_consecutive_detections) of the same kind as the input frame."""
+        """Update ONCE per sensor frame with all kinds, in one fixed frame.
+
+        Each track can receive at most one hit per frame. Missing a frame
+        resets its consecutive-hit count; retained tracks still keep their
+        identity for up to five missed frames by default. max_missed_frames=None
+        retains fixed-world track identities until explicitly removed.
+        """
         gate = self.cfg.detection_match_radius_m
         matched_track_ids = set()
+        previous_tracks = list(self._tracks)
 
         for det in detections:
             best_track = None
             best_dist = gate
-            for track in self._tracks:
-                if track.kind != det.kind:
+            for track in previous_tracks:
+                if id(track) in matched_track_ids or track.kind != det.kind:
+                    continue
+                if track.coordinate_frame != det.coordinate_frame:
+                    continue
+                if (track.object_class is not None and det.object_class is not None
+                        and track.object_class != det.object_class):
                     continue
                 dist = float(np.linalg.norm(
                     track.position_robot[:2] - det.position_robot[:2]))
@@ -498,6 +569,12 @@ class DetectionTracker:
                 best_track.position_robot = 0.7 * best_track.position_robot + 0.3 * det.position_robot
                 best_track.radius_m = max(best_track.radius_m, det.radius_m)
                 best_track.confidence += 1
+                best_track.pixel_centroid = det.pixel_centroid
+                best_track.object_class = det.object_class
+                best_track.size_m = det.size_m
+                best_track.orientation_rad = det.orientation_rad
+                best_track.estimated_mass_kg = det.estimated_mass_kg
+                best_track.observed_at_s = det.observed_at_s
                 matched_track_ids.add(id(best_track))
                 self._misses[id(best_track)] = 0
             else:
@@ -512,7 +589,10 @@ class DetectionTracker:
         for track in self._tracks:
             if id(track) not in matched_track_ids:
                 self._misses[id(track)] = self._misses.get(id(track), 0) + 1
-                if self._misses[id(track)] > 5:
+                track.confidence = 0
+                if (self.max_missed_frames is not None
+                        and self._misses[id(track)] > self.max_missed_frames):
+                    self._misses.pop(id(track), None)
                     continue  # drop stale track
             surviving.append(track)
         self._tracks = surviving
@@ -524,3 +604,4 @@ class DetectionTracker:
         """Call after a stain has been scrubbed / debris avoided, so it's
         not immediately re-triggered."""
         self._tracks = [t for t in self._tracks if t is not track]
+        self._misses.pop(id(track), None)

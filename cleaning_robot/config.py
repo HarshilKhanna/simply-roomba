@@ -88,7 +88,8 @@ class CameraExtrinsics:
 
 @dataclass
 class RobotGeometry:
-    radius_m: float = 0.17               # R, mop/chassis radius
+    radius_m: float = 0.17               # mop cleaning radius (legacy name)
+    chassis_radius_m: float = 0.17       # collision geometry, independent of mop
     max_linear_vel: float = 0.25         # m/s, coverage cruise speed
     max_angular_vel: float = 1.5         # rad/s
     scrub_linear_vel: float = 0.16       # m/s, slow speed during spot scrub
@@ -132,9 +133,68 @@ class PlanningConfig:
 
 
 @dataclass
+class CollectorConfig:
+    """Provisional scoop/claw dimensions, not a specification for hardware.
+
+    Collection is opt-in. The ROS node continues to avoid debris unless a
+    collector with real feedback is explicitly connected.
+    """
+    enabled: bool = False
+    opening_width_m: float = 0.22
+    palm_depth_m: float = 0.18
+    pickup_offset_m: float = 0.32       # base centre -> palm centre
+    carry_offset_m: float = 0.22        # lift pivots the palm back toward the base
+    carry_height_m: float = 0.08        # illustrative raised carrying pose
+    stowed_front_m: float = 0.20
+    max_length_m: float = 0.24
+    max_width_m: float = 0.18
+    max_height_m: float = 0.16
+    max_payload_kg: float = 0.12
+    approach_standoff_m: float = 0.12
+    alignment_tolerance_m: float = 0.012
+    heading_tolerance_rad: float = 0.06
+    pickup_speed_m_s: float = 0.05
+    return_speed_m_s: float = 0.14
+    home_tolerance_m: float = 0.025
+    operation_timeout_s: float = 4.0
+    verification_timeout_s: float = 2.0
+    navigation_timeout_s: float = 90.0
+    max_pickup_attempts: int = 2
+
+
+@dataclass
+class D405Config:
+    """Nominal D405 workspace for simulation; verify the real stream profile."""
+    min_depth_m: float = 0.07
+    max_depth_m: float = 0.50
+    horizontal_fov_deg: float = 87.0
+    vertical_fov_deg: float = 58.0
+    mount: CameraExtrinsics = field(default_factory=lambda: CameraExtrinsics(
+        pitch_deg=45.0, height_m=0.22, forward_offset_m=0.08))
+
+
+@dataclass
+class SimulationConfig:
+    arena_width_m: float = 3.2
+    arena_height_m: float = 2.4
+    home_pose: tuple = (0.50, 0.50, 0.0)
+    time_step_s: float = 0.05
+    perception_period_s: float = 0.10
+    grid_resolution_m: float = 0.04
+    obstacle_margin_m: float = 0.015
+    lower_duration_s: float = 0.45
+    close_duration_s: float = 0.55
+    lift_duration_s: float = 0.55
+    seed: int = 7
+
+
+@dataclass
 class RobotConfig:
     intrinsics: CameraIntrinsics = field(default_factory=CameraIntrinsics)
     extrinsics: CameraExtrinsics = field(default_factory=CameraExtrinsics)
     geometry: RobotGeometry = field(default_factory=RobotGeometry)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
     planning: PlanningConfig = field(default_factory=PlanningConfig)
+    collector: CollectorConfig = field(default_factory=CollectorConfig)
+    d405: D405Config = field(default_factory=D405Config)
+    simulation: SimulationConfig = field(default_factory=SimulationConfig)

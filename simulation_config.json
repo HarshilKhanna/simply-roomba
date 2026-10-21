@@ -1,0 +1,33 @@
+{
+  "collector": {
+    "enabled": true,
+    "opening_width_m": 0.22,
+    "palm_depth_m": 0.18,
+    "pickup_offset_m": 0.32,
+    "carry_offset_m": 0.22,
+    "carry_height_m": 0.08,
+    "max_length_m": 0.24,
+    "max_width_m": 0.18,
+    "max_height_m": 0.16,
+    "max_payload_kg": 0.12,
+    "max_pickup_attempts": 2
+  },
+  "d405": {
+    "min_depth_m": 0.07,
+    "max_depth_m": 0.5,
+    "horizontal_fov_deg": 87.0,
+    "vertical_fov_deg": 58.0,
+    "mount": {
+      "height_m": 0.22,
+      "pitch_deg": 45.0,
+      "forward_offset_m": 0.08
+    }
+  },
+  "simulation": {
+    "arena_width_m": 3.2,
+    "arena_height_m": 2.4,
+    "home_pose": [0.5, 0.5, 0.0],
+    "time_step_s": 0.05,
+    "seed": 7
+  }
+}
